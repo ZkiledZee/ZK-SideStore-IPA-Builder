@@ -1,0 +1,409 @@
+name: ZK SideStore IPA Builder
+
+on:
+  push:
+    paths:
+      - '*.zip'
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: 'Optional ZIP filename in repo root. Leave blank to use the latest filename.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zk-sidestore-builder-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build SideStore IPA
+    runs-on: macos-15
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Select app ZIP
+        id: select
+        shell: bash
+        env:
+          MANUAL_ZIP: ${{ github.event.inputs.zip_name || '' }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "$MANUAL_ZIP" ]]; then
+            ZIP_FILE="${MANUAL_ZIP##*/}"
+          else
+            ZIP_FILE=""
+            if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+              BEFORE="${{ github.event.before }}"
+              if [[ -n "$BEFORE" && "$BEFORE" != "0000000000000000000000000000000000000000" ]]; then
+                ZIP_FILE="$(git diff --name-only "$BEFORE" "$GITHUB_SHA" -- '*.zip' | grep -E '^[^/]+\.zip$' | tail -n 1 || true)"
+              fi
+            fi
+            if [[ -z "$ZIP_FILE" ]]; then
+              ZIP_FILE="$(printf '%s\n' ./*.zip | sed 's#^\./##' | grep -v '\*' | sort | tail -n 1 || true)"
+            fi
+          fi
+
+          if [[ -z "$ZIP_FILE" || ! -f "$ZIP_FILE" ]]; then
+            echo "::error::No app source ZIP was found in the repository root. Upload a .zip next to this repo's README, then commit it."
+            exit 1
+          fi
+
+          echo "Selected: $ZIP_FILE"
+          echo "zip=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Show build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          swift --version
+
+      - name: Validate and extract ZIP safely
+        shell: bash
+        env:
+          APP_ZIP: ${{ steps.select.outputs.zip }}
+        run: |
+          set -euo pipefail
+          rm -rf "$RUNNER_TEMP/zk_extract" "$RUNNER_TEMP/zk_app"
+          mkdir -p "$RUNNER_TEMP/zk_extract"
+
+          python3 - <<'PY'
+          import os, shutil, stat, sys, zipfile
+          from pathlib import Path, PurePosixPath
+
+          zip_path = Path(os.environ['APP_ZIP']).resolve()
+          dest = Path(os.environ['RUNNER_TEMP']).resolve() / 'zk_extract'
+          max_size = 2 * 1024 * 1024 * 1024
+          max_entries = 25000
+
+          if not zip_path.is_file() or zip_path.stat().st_size == 0:
+              raise SystemExit(f'ERROR: ZIP is missing or empty: {zip_path}')
+          try:
+              zf = zipfile.ZipFile(zip_path)
+          except zipfile.BadZipFile:
+              raise SystemExit('ERROR: Uploaded file is not a valid ZIP archive.')
+
+          infos = zf.infolist()
+          if not infos:
+              raise SystemExit('ERROR: ZIP contains no files.')
+          if len(infos) > max_entries:
+              raise SystemExit(f'ERROR: ZIP contains too many entries ({len(infos)}).')
+
+          total = 0
+          dest.mkdir(parents=True, exist_ok=True)
+          for info in infos:
+              name = info.filename.replace('\\', '/')
+              p = PurePosixPath(name)
+              if p.is_absolute() or '..' in p.parts:
+                  raise SystemExit(f'ERROR: Unsafe path in ZIP: {name}')
+              mode = info.external_attr >> 16
+              if stat.S_ISLNK(mode):
+                  raise SystemExit(f'ERROR: Symbolic links are not accepted: {name}')
+              total += info.file_size
+              if total > max_size:
+                  raise SystemExit('ERROR: ZIP expands beyond the 2 GB safety limit.')
+              target = (dest / Path(*p.parts)).resolve()
+              if os.path.commonpath([str(dest), str(target)]) != str(dest):
+                  raise SystemExit(f'ERROR: Unsafe extraction target: {name}')
+              if info.is_dir():
+                  target.mkdir(parents=True, exist_ok=True)
+              else:
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with zf.open(info, 'r') as src, open(target, 'wb') as out:
+                      shutil.copyfileobj(src, out)
+                  if mode & stat.S_IXUSR:
+                      target.chmod(target.stat().st_mode | stat.S_IXUSR)
+
+          print(f'Validated {len(infos)} ZIP entries ({total} bytes uncompressed).')
+          PY
+
+      - name: Prepare source root
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import shutil, os
+          from pathlib import Path
+
+          temp = Path(os.environ['RUNNER_TEMP'])
+          src = temp / 'zk_extract'
+          dest = temp / 'zk_app'
+          ignored = {'__MACOSX', '.DS_Store'}
+
+          def children(path):
+              return [p for p in path.iterdir() if p.name not in ignored and not p.name.startswith('._')]
+
+          def marker_here(path):
+              return ((path / 'project.yml').is_file() or
+                      (path / 'project.yaml').is_file() or
+                      any(path.glob('*.xcodeproj')) or
+                      any(path.glob('*.xcworkspace')))
+
+          items = children(src)
+          if not items:
+              raise SystemExit('ERROR: ZIP extracted but has no usable source files.')
+
+          root = src
+          if len(items) == 1 and items[0].is_dir() and not marker_here(src):
+              root = items[0]
+
+          if dest.exists():
+              shutil.rmtree(dest)
+          shutil.copytree(root, dest, ignore=shutil.ignore_patterns('__MACOSX', '.DS_Store', '._*'))
+          print(f'Using source root: {root}')
+          PY
+
+          echo "Source preview:"
+          find "$RUNNER_TEMP/zk_app" -type f | sed 's#^.*/zk_app/##' | sed -n '1,120p'
+
+      - name: Create Xcode project when ZIP uses XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/zk_app"
+
+          HAS_CONTAINER="$(python3 - <<'PY'
+          from pathlib import Path
+          root = Path('.')
+          found = any(root.rglob('*.xcodeproj')) or any(root.rglob('*.xcworkspace'))
+          print('yes' if found else 'no')
+          PY
+          )"
+
+          if [[ "$HAS_CONTAINER" == "no" ]]; then
+            PROJECT_SPEC="$(python3 - <<'PY'
+          from pathlib import Path
+          root = Path('.')
+          candidates = sorted(list(root.rglob('project.yml')) + list(root.rglob('project.yaml')), key=lambda p: (len(p.parts), str(p)))
+          print(candidates[0] if candidates else '')
+          PY
+            )"
+
+            if [[ -z "$PROJECT_SPEC" ]]; then
+              echo "::error::No .xcodeproj, .xcworkspace, project.yml, or project.yaml was found in the ZIP."
+              exit 1
+            fi
+
+            if ! command -v xcodegen >/dev/null 2>&1; then
+              echo "Installing XcodeGen..."
+              brew install xcodegen
+            fi
+            echo "Generating project from: $PROJECT_SPEC"
+            (cd "$(dirname "$PROJECT_SPEC")" && xcodegen generate --spec "$(basename "$PROJECT_SPEC")")
+          fi
+
+      - name: Detect Xcode project and scheme
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/zk_app"
+
+          python3 - <<'PY' > "$RUNNER_TEMP/build.env"
+          import json, subprocess, sys
+          from pathlib import Path
+
+          root = Path('.').resolve()
+          override = {}
+          cfg = root / 'builder.json'
+          if cfg.is_file():
+              try:
+                  override = json.loads(cfg.read_text())
+              except Exception as e:
+                  raise SystemExit(f'ERROR: builder.json is invalid: {e}')
+              if not isinstance(override, dict):
+                  raise SystemExit('ERROR: builder.json must contain a JSON object.')
+
+          def candidates(suffix):
+              out = []
+              for p in root.rglob(f'*{suffix}'):
+                  if not p.is_dir():
+                      continue
+                  rel = p.relative_to(root)
+                  if any(part in {'.build', 'DerivedData', 'Pods', 'Carthage'} for part in rel.parts):
+                      continue
+                  if suffix == '.xcworkspace' and p.name == 'project.xcworkspace' and p.parent.suffix == '.xcodeproj':
+                      continue
+                  out.append(p)
+              return sorted(out, key=lambda p: (len(p.relative_to(root).parts), str(p)))
+
+          explicit = override.get('workspace') or override.get('project')
+          if explicit:
+              container = (root / explicit).resolve()
+              if not container.exists():
+                  raise SystemExit(f'ERROR: builder.json points to a missing file: {explicit}')
+              kind = 'workspace' if container.suffix == '.xcworkspace' else 'project'
+          else:
+              workspaces = candidates('.xcworkspace')
+              projects = candidates('.xcodeproj')
+              if workspaces:
+                  container, kind = workspaces[0], 'workspace'
+              elif projects:
+                  container, kind = projects[0], 'project'
+              else:
+                  raise SystemExit('ERROR: No Xcode project/workspace exists after project generation.')
+
+          rel = str(container.relative_to(root))
+          flag = '-workspace' if kind == 'workspace' else '-project'
+          proc = subprocess.run(['xcodebuild', flag, rel, '-list', '-json'], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+          if proc.returncode != 0:
+              print(proc.stdout, file=sys.stderr)
+              print(proc.stderr, file=sys.stderr)
+              raise SystemExit(f'ERROR: xcodebuild could not inspect {rel}.')
+          try:
+              data = json.loads(proc.stdout)
+          except Exception:
+              print(proc.stdout, file=sys.stderr)
+              print(proc.stderr, file=sys.stderr)
+              raise SystemExit('ERROR: Could not parse xcodebuild project information.')
+
+          info = data.get('workspace' if kind == 'workspace' else 'project', {})
+          schemes = info.get('schemes') or []
+          targets = info.get('targets') or []
+          requested = override.get('scheme')
+
+          if requested:
+              selector_kind = 'scheme'
+              selector = str(requested)
+              if schemes and selector not in schemes:
+                  raise SystemExit(f"ERROR: Requested scheme '{selector}' not found. Available: {', '.join(schemes)}")
+          elif schemes:
+              preferred = [s for s in schemes if 'test' not in s.lower()]
+              selector_kind = 'scheme'
+              selector = preferred[0] if preferred else schemes[0]
+          elif kind == 'project' and targets:
+              preferred = [t for t in targets if 'test' not in t.lower()]
+              selector_kind = 'target'
+              selector = preferred[0] if preferred else targets[0]
+          else:
+              raise SystemExit('ERROR: No shared scheme could be detected. Add a shared scheme or builder.json.')
+
+          def emit(k, v):
+              v = str(v).replace('\n', ' ').replace('\r', ' ')
+              print(f'{k}={v}')
+
+          emit('container_kind', kind)
+          emit('container_path', rel)
+          emit('selector_kind', selector_kind)
+          emit('selector_name', selector)
+          PY
+
+          cat "$RUNNER_TEMP/build.env"
+          cat "$RUNNER_TEMP/build.env" >> "$GITHUB_OUTPUT"
+
+      - name: Build unsigned iPhone app
+        shell: bash
+        env:
+          CONTAINER_KIND: ${{ steps.detect.outputs.container_kind }}
+          CONTAINER_PATH: ${{ steps.detect.outputs.container_path }}
+          SELECTOR_KIND: ${{ steps.detect.outputs.selector_kind }}
+          SELECTOR_NAME: ${{ steps.detect.outputs.selector_name }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/zk_app"
+          rm -rf "$RUNNER_TEMP/DerivedData"
+
+          if [[ "$CONTAINER_KIND" == "workspace" ]]; then
+            CONTAINER_ARGS=(-workspace "$CONTAINER_PATH")
+          else
+            CONTAINER_ARGS=(-project "$CONTAINER_PATH")
+          fi
+
+          if [[ "$SELECTOR_KIND" == "scheme" ]]; then
+            SELECTOR_ARGS=(-scheme "$SELECTOR_NAME")
+          else
+            SELECTOR_ARGS=(-target "$SELECTOR_NAME")
+          fi
+
+          echo "Building $SELECTOR_KIND '$SELECTOR_NAME' from '$CONTAINER_PATH'"
+          set -o pipefail
+          xcodebuild \
+            "${CONTAINER_ARGS[@]}" \
+            "${SELECTOR_ARGS[@]}" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY='' \
+            DEVELOPMENT_TEAM='' \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            clean build | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Package valid IPA
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_PATH="$(python3 - <<'PY'
+          import os
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'DerivedData' / 'Build' / 'Products'
+          apps = sorted(root.rglob('Release-iphoneos/*.app')) if root.exists() else []
+          print(apps[0] if apps else '')
+          PY
+          )"
+
+          if [[ -z "$APP_PATH" || ! -d "$APP_PATH" ]]; then
+            echo "::error::Xcode finished but no Release-iphoneos .app bundle was produced."
+            find "$RUNNER_TEMP/DerivedData/Build/Products" -print 2>/dev/null | sed -n '1,150p' || true
+            exit 1
+          fi
+
+          APP_NAME="$(basename "$APP_PATH" .app)"
+          SAFE_NAME="$(printf '%s' "$APP_NAME" | tr ' /:' '___')"
+          IPA_ROOT="$RUNNER_TEMP/ipa"
+          OUT="$GITHUB_WORKSPACE/${SAFE_NAME}.ipa"
+
+          rm -rf "$IPA_ROOT" "$OUT"
+          mkdir -p "$IPA_ROOT/Payload"
+          cp -R "$APP_PATH" "$IPA_ROOT/Payload/"
+          (cd "$IPA_ROOT" && /usr/bin/zip -qry "$OUT" Payload)
+
+          if [[ ! -s "$OUT" ]]; then
+            echo "::error::IPA packaging failed or produced an empty file."
+            exit 1
+          fi
+          if ! /usr/bin/unzip -tq "$OUT" >/dev/null; then
+            echo "::error::The generated IPA is not a valid ZIP/IPA archive."
+            exit 1
+          fi
+          if ! /usr/bin/unzip -l "$OUT" | grep -q "Payload/${APP_NAME}.app/"; then
+            echo "::error::IPA does not contain Payload/${APP_NAME}.app/."
+            exit 1
+          fi
+
+          echo "Successfully created: $OUT"
+          echo "app_name=$APP_NAME" >> "$GITHUB_OUTPUT"
+          echo "ipa_path=$OUT" >> "$GITHUB_OUTPUT"
+          /usr/bin/unzip -l "$OUT" | sed -n '1,40p'
+
+      - name: Upload SideStore IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.app_name }}-SideStore-IPA
+          path: ${{ steps.package.outputs.ipa_path }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: |
+            ${{ runner.temp }}/xcodebuild.log
+            ${{ runner.temp }}/build.env
+          if-no-files-found: ignore
+          retention-days: 14
